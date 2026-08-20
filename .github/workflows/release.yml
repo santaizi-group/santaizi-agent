@@ -86,6 +86,7 @@ jobs:
         if: ${{ github.event_name != 'pull_request' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           CI_TAG: ci-${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -117,9 +118,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      # gh infers the repo from git remotes. This job has no checkout, so
+      # GH_REPO is required; otherwise download fails with "not a git repository".
       - name: Download binaries from temporary release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           CI_TAG: ci-${{ github.run_id }}
         run: |
           mkdir -p bin
@@ -146,5 +150,14 @@ jobs:
       - name: Delete temporary CI release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           CI_TAG: ci-${{ github.run_id }}
-        run: gh release delete "$CI_TAG" --yes --cleanup-tag || gh release delete "$CI_TAG" --yes || true
+        run: |
+          set -euo pipefail
+          if gh release view "$CI_TAG" >/dev/null 2>&1; then
+            gh release delete "$CI_TAG" --yes
+          else
+            echo "no temporary release $CI_TAG to delete"
+          fi
+          # Drafts may be untagged; ignore a missing git ref.
+          gh api -X DELETE "repos/${GH_REPO}/git/refs/tags/${CI_TAG}" >/dev/null 2>&1 || true
