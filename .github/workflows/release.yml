@@ -38,6 +38,8 @@ jobs:
 
     name: Build artifacts
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       GOOS: ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}
@@ -77,12 +79,36 @@ jobs:
       - name: Archive
         run: zip -jr dist/santaizi-agent_${GOOS}_${GOARCH}.zip dist/*/*
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: santaizi-agent_${{ env.GOOS }}_${{ env.GOARCH }}
-          path: |
-            ./dist/santaizi-agent_${{ env.GOOS }}_${{ env.GOARCH }}.zip
+      # Private repos on GitHub Free share a ~500MB Actions artifact quota
+      # across the whole account. Stage binaries on a per-run draft release
+      # instead so publish jobs are not blocked by that quota.
+      - name: Upload binaries to temporary release
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_TAG: ci-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if gh release view "$CI_TAG" >/dev/null 2>&1; then
+              break
+            fi
+            gh release create "$CI_TAG" \
+              --draft \
+              --target "${{ github.sha }}" \
+              --title "CI artifacts ${{ github.run_id }}" \
+              --notes "Temporary build outputs for ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. Deleted after publish." \
+              && break || true
+            sleep 2
+          done
+          gh release view "$CI_TAG" >/dev/null
+          shopt -s nullglob
+          files=(dist/santaizi-agent_${GOOS}_${GOARCH}*.zip)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no build outputs to upload" >&2
+            exit 1
+          fi
+          gh release upload "$CI_TAG" "${files[@]}" --clobber
 
   release:
     runs-on: ubuntu-latest
@@ -91,16 +117,34 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./assets
+      - name: Download binaries from temporary release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_TAG: ci-${{ github.run_id }}
+        run: |
+          mkdir -p bin
+          gh release download "$CI_TAG" --dir bin
+          ls -la bin/
 
       - name: Checksum
-        run: sha256sum ./assets/*/*.zip | awk -F" |/" '{print $1, $NF}' > checksums.txt
+        run: sha256sum ./bin/*.zip | awk -F" |/" '{print $1, $NF}' > checksums.txt
 
       - name: Release
         uses: ncipollo/release-action@v1
         with:
-          artifacts: "checksums.txt,assets/*/*.zip"
+          artifacts: "checksums.txt,bin/*.zip"
           generateReleaseNotes: true
+
+  cleanup:
+    name: Cleanup CI release
+    permissions:
+      contents: write
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete temporary CI release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_TAG: ci-${{ github.run_id }}
+        run: gh release delete "$CI_TAG" --yes --cleanup-tag || gh release delete "$CI_TAG" --yes || true
